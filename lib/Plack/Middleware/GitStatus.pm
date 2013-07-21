@@ -1,53 +1,79 @@
 package Plack::Middleware::GitStatus;
 use strict;
 use warnings;
-our $VERSION = '0.01';
+our $VERSION = '0.02';
 
 use parent 'Plack::Middleware';
 use Plack::Util::Accessor qw(path git_dir);
 use Plack::Util;
 
+use Cache::FileCache;
 use Cwd;
 use Git::Repository 'Log';
 use Time::Piece;
 use Try::Tiny;
 
+our $CACHE = Cache::FileCache->new({
+    namespace          => 'Plack::Middleware::GitStatus',
+    default_expires_in => 24 * 60 * 60,  # 1 day
+});
+our $CACHE_KEY = 'git-status';
+
 our $WORKTREE;
 
 sub prepare_app {
     my $self = shift;
+
     try {
         $WORKTREE = Git::Repository->new(work_tree => $self->{git_dir} || getcwd);
     } catch {
-        $self->{error} = $_;
+        $self->{error} ||= $_;
     };
+
+    # reset git message cache when restating app
+    $CACHE->clear;
+    $CACHE->set($CACHE_KEY => $self->_git_message || '');
 }
 
 sub call {
     my ($self, $env) = @_;
 
     if ($self->path && $env->{PATH_INFO} eq $self->path) {
+        my $body = $CACHE->get($CACHE_KEY) || do {
+            $CACHE->set($CACHE_KEY => $self->_git_message || '');
+        };
+
         if ($self->{error}) {
             return [500, ['Content-Type' => 'text/plain'], [ $self->{error} ]];
         }
-        my ($brach_name, $last_commit);
-        try {
-            $brach_name  = $self->_current_branch;
-            $last_commit = $self->_last_commit;
-        } catch {
-            return [500, ['Content-Type' => 'text/plain'], [ $_ ]];
-        };
-
-        my $body  = "CurrentBranch: $brach_name\n";
-           $body .= sprintf "Commit: %s\n",  $last_commit->{commit};
-           $body .= sprintf "Author: %s\n",  $last_commit->{author};
-           $body .= sprintf "Date: %s\n",    $last_commit->{date};
-           $body .= sprintf "Message: %s",   $last_commit->{message};
 
         return [200, ['Content-Type' => 'text/plain'], [ $body ]];
     }
 
     return $self->app->($env);
+}
+
+sub _git_message {
+    my $self = shift;
+
+    return undef unless defined $WORKTREE;
+
+    my ($brach_name, $last_commit);
+    try {
+        $brach_name  = $self->_current_branch;
+        $last_commit = $self->_last_commit;
+    } catch {
+        $self->{error} ||= $_;
+        return undef;
+    };
+
+    my $msg  = "CurrentBranch: $brach_name\n";
+       $msg .= sprintf "Commit: %s\n",  $last_commit->{commit};
+       $msg .= sprintf "Author: %s\n",  $last_commit->{author};
+       $msg .= sprintf "Date: %s\n",    $last_commit->{date};
+       $msg .= sprintf "Message: %s",   $last_commit->{message};
+
+    return $msg;
 }
 
 sub _current_branch {
@@ -90,7 +116,7 @@ Plack::Middleware::GitStatus - Provide Git status via HTTP
 
         enable "Plack::Middleware::GitStatus", (
             path  => '/git-status', git_dir => '/path/to/repository'
-        ) if $PLACK_ENV eq 'staging';
+        ) if $ENV{PLACK_ENV} eq 'staging';
 
         $app;
     };
@@ -114,7 +140,7 @@ Plack::Middleware::GitStatus add URI location displaying the information to your
 
 =item path
 
-    path => '/server-status',
+    path => '/git-status',
 
 location that displays git status
 
